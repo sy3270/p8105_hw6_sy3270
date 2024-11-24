@@ -1,0 +1,198 @@
+---
+title: "p8105_hw6_sy3270"
+output: html_document
+date: "2024-11-24"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(rnoaa)
+library(broom)
+library(purrr)
+library(modelr)
+library(p8105.datasets)
+library(ggplot2)
+library(modelr)
+set.seed(1)
+```
+
+### Problem 1: Bootstrap Analysis on Weather Data
+
+```{r problem1, echo = TRUE}
+weather_df = select(
+  mutate(
+    rnoaa::meteo_pull_monitors(
+      c("USW00094728"),
+      var = c("PRCP", "TMIN", "TMAX"),
+      date_min = "2017-01-01",
+      date_max = "2017-12-31"
+    ),
+    name = recode(id, USW00094728 = "CentralPark_NY"),
+    tmin = tmin / 10,
+    tmax = tmax / 10
+  ),
+  name, id, everything()
+)
+
+bootstrap_samples = modelr::bootstrap(weather_df, n = 5000)
+models = map(bootstrap_samples$strap, function(.x) lm(tmax ~ tmin, data = .x))
+r_squared = map_dbl(models, function(.x) broom::glance(.x)$r.squared)
+log_beta = map_dbl(models, function(.x) {
+  coefs = broom::tidy(.x)
+  log(coefs$estimate[1] * coefs$estimate[2])
+})
+
+bootstrap_results = data.frame(r_squared, log_beta)
+
+
+ggplot(pivot_longer(bootstrap_results, everything(), names_to = "metric", values_to = "value"), aes(x = value)) +
+  geom_histogram() +
+  facet_wrap(~metric, scales = "free")
+
+
+data.frame(
+  r_squared_CI = quantile(r_squared, c(0.025, 0.975)),
+  log_beta_CI = quantile(log_beta, c(0.025, 0.975))
+)
+
+
+```
+The r_squared distribution shows that the linear model consistently explains approximately 90% of the variance in tmax, demonstrating a strong relationship between tmax and tmin. The log_beta distribution, centered around 2.0, reflects the stability of the transformed regression coefficients across bootstrap samples. These results indicate that the model is reliable, with low variability in its ability to capture the relationship between the predictors and the outcome.
+
+
+---
+
+### Problem 2: Homicide Analysis
+
+```{r problem2, echo = TRUE}
+
+homicides_raw = read_csv("https://github.com/washingtonpost/data-homicides/raw/master/homicide-data.csv")
+
+homicides = mutate(
+  filter(
+    mutate(
+      homicides_raw,
+      city_state = str_c(city, state, sep = ", "),
+      resolved = as.numeric(disposition == "Closed by arrest"),
+      victim_race = fct_relevel(victim_race, "White")
+    ),
+    !city_state %in% c("Dallas, TX", "Phoenix, AZ", "Kansas City, MO", "Tulsa, AL"),
+    victim_race %in% c("White", "Black")
+  )
+)
+
+
+baltimore_data = filter(homicides, city_state == "Baltimore, MD")
+baltimore_glm = glm(resolved ~ victim_age + victim_sex + victim_race, family = binomial(), data = baltimore_data)
+
+baltimore_results = mutate(
+  broom::tidy(baltimore_glm),
+  OR = exp(estimate),
+  .before = estimate
+)
+
+homicides_grouped = group_by(homicides, city_state)
+homicides_nested = nest(homicides_grouped)
+
+homicides_nested$models = map(homicides_nested$data, function(data) {
+  glm(resolved ~ victim_age + victim_sex + victim_race, family = binomial(), data = data)
+})
+
+homicides_nested$results = map(homicides_nested$models, function(model) {
+  tidy_model = broom::tidy(model)
+  filtered_model = filter(tidy_model, term == "victim_sexMale")
+  mutate(filtered_model,
+         OR = exp(estimate),
+         CI_low = exp(estimate - 1.96 * std.error),
+         CI_high = exp(estimate + 1.96 * std.error))
+})
+
+
+city_glm_results = unnest(select(homicides_nested, city_state, results), cols = results)
+
+
+city_glm_results$city_state = reorder(city_glm_results$city_state, city_glm_results$OR)
+
+ggplot(data = city_glm_results, aes(x = city_state, y = OR, ymin = CI_low, ymax = CI_high)) +
+  geom_pointrange() +
+  coord_flip() +
+  labs(title = "Odds Ratios for Male vs Female Victims by City", y = "Adjusted OR", x = "City")
+
+
+
+```
+The odds ratios for solving homicides comparing male to female victims vary by city, with most cities showing ORs near or below 1. This suggests that homicides involving male victims are generally not more likely to be solved than those involving female victims. Wide confidence intervals for some cities indicate uncertainty in these estimates, likely due to small or sparse datasets, while tighter intervals for others reflect more reliable data. The variability underscores the importance of city-specific factors in determining homicide resolution rates.
+
+
+
+---
+
+### Problem 3: Birthweight Analysis
+
+```{r problem3, echo = TRUE}
+
+
+birthweight_df = read_csv("./birthweight.csv")
+birthweight_df = mutate(birthweight_df, across(c(babysex, frace, mrace), as_factor))
+fit_birthweight = lm(bwt ~ blength + bhead + delwt + fincome, data = birthweight_df)
+
+# Add predictions and residuals for visualization
+birthweight_with_predictions = modelr::add_predictions(birthweight_df, fit_birthweight)
+birthweight_with_residuals = modelr::add_residuals(birthweight_with_predictions, fit_birthweight)
+
+# Plot residuals vs fitted values
+ggplot(data = birthweight_with_residuals, aes(x = pred, y = resid)) +
+  geom_point() +
+  labs(title = "Residuals vs Fitted Values",
+       x = "Predicted Birthweight",
+       y = "Residuals")
+
+
+cv_data = crossv_mc(birthweight_df, 100)
+
+# Fit models and calculate prediction errors
+cv_data = mutate(cv_data,
+  model1 = map(train, function(.x) lm(bwt ~ blength + gaweeks, data = as.data.frame(.x))),
+  model2 = map(train, function(.x) lm(bwt ~ bhead * blength * babysex, data = as.data.frame(.x))),
+  model3 = map(train, function(.x) lm(bwt ~ blength + bhead + delwt + fincome, data = as.data.frame(.x))),
+  error1 = map2_dbl(model1, test, function(model, test_data) {
+    test_data = as.data.frame(test_data)  # Convert test data to data frame
+    mean((predict(model, newdata = test_data) - test_data$bwt)^2, na.rm = TRUE)
+  }),
+  error2 = map2_dbl(model2, test, function(model, test_data) {
+    test_data = as.data.frame(test_data)
+    mean((predict(model, newdata = test_data) - test_data$bwt)^2, na.rm = TRUE)
+  }),
+  error3 = map2_dbl(model3, test, function(model, test_data) {
+    test_data = as.data.frame(test_data)
+    mean((predict(model, newdata = test_data) - test_data$bwt)^2, na.rm = TRUE)
+  })
+)
+
+
+cv_results = select(cv_data, error1, error2, error3)
+cv_summary = summarise(cv_results, across(everything(), mean))
+
+
+print(cv_summary)
+
+
+cv_results_long = pivot_longer(cv_summary, cols = everything(), names_to = "Model", values_to = "Error")
+
+ggplot(cv_results_long, aes(x = Model, y = Error)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Cross-Validation Errors for Models",
+       x = "Model",
+       y = "Mean Squared Error")
+
+
+
+```
+
+The analysis of birthweight used a primary regression model with predictors blength, bhead, delwt, and fincome. The residuals vs. fitted values plot showed that the model is unbiased, with residuals centered around zero. However, there is evidence of heteroscedasticity, with increasing variability at extreme fitted values, and the presence of a few outliers. These findings suggest that while the model captures general trends, further refinements, such as addressing outliers or stabilizing variance using transformations, may enhance its performance.
+
+Cross-validation compared three models to evaluate predictive accuracy. Model 1, using only blength and gaweeks, had the highest prediction error (111,294.6). Model 2, which included bhead, blength, and babysex with interaction terms, improved accuracy with an error of 83,844.67. Model 3, which incorporated maternal characteristics (delwt and fincome), achieved the lowest prediction error (81,087.68), indicating the best predictive performance. These results highlight the importance of including maternal factors for predicting birthweight. However, given the heteroscedasticity and outliers observed, further refinement of Model 3, such as exploring interaction terms or testing additional predictors, could improve its robustness and overall accuracy.
+
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
