@@ -20,45 +20,65 @@ set.seed(1)
 ### Problem 1: Bootstrap Analysis on Weather Data
 
 ```{r problem1, echo = TRUE}
-weather_df = select(
-  mutate(
-    rnoaa::meteo_pull_monitors(
-      c("USW00094728"),
-      var = c("PRCP", "TMIN", "TMAX"),
-      date_min = "2017-01-01",
-      date_max = "2017-12-31"
-    ),
-    name = recode(id, USW00094728 = "CentralPark_NY"),
-    tmin = tmin / 10,
-    tmax = tmax / 10
-  ),
-  name, id, everything()
+
+weather_data_raw = rnoaa::meteo_pull_monitors(
+  c("USW00094728"),
+  var = c("PRCP", "TMIN", "TMAX"),
+  date_min = "2017-01-01",
+  date_max = "2017-12-31"
 )
 
+
+weather_data_raw$name = recode(weather_data_raw$id, USW00094728 = "CentralPark_NY")
+weather_data_raw$tmin = weather_data_raw$tmin / 10
+weather_data_raw$tmax = weather_data_raw$tmax / 10
+weather_df = weather_data_raw[, c("name", "id", names(weather_data_raw)[!(names(weather_data_raw) %in% c("name", "id"))])]
+
+
 bootstrap_samples = modelr::bootstrap(weather_df, n = 5000)
-models = map(bootstrap_samples$strap, function(.x) lm(tmax ~ tmin, data = .x))
-r_squared = map_dbl(models, function(.x) broom::glance(.x)$r.squared)
-log_beta = map_dbl(models, function(.x) {
-  coefs = broom::tidy(.x)
+
+models = map(bootstrap_samples$strap, function(sample) lm(tmax ~ tmin, data = sample))
+
+r_squared = map_dbl(models, function(model) broom::glance(model)$r.squared)
+
+
+log_beta = map_dbl(models, function(model) {
+  coefs = broom::tidy(model)
   log(coefs$estimate[1] * coefs$estimate[2])
 })
 
-bootstrap_results = data.frame(r_squared, log_beta)
+bootstrap_results = data.frame(r_squared = r_squared, log_beta = log_beta)
 
 
-ggplot(pivot_longer(bootstrap_results, everything(), names_to = "metric", values_to = "value"), aes(x = value)) +
-  geom_histogram() +
-  facet_wrap(~metric, scales = "free")
+bootstrap_results_long = tidyr::pivot_longer(
+  bootstrap_results, 
+  cols = everything(), 
+  names_to = "metric", 
+  values_to = "value"
+)
 
 
-data.frame(
+ggplot(bootstrap_results_long, aes(x = value)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~metric, scales = "free") +
+  labs(
+    title = "Bootstrap Distributions of r-squared and log(beta0*beta1)",
+    x = "Value",
+    y = "Frequency"
+  )
+
+
+ci_results = data.frame(
   r_squared_CI = quantile(r_squared, c(0.025, 0.975)),
   log_beta_CI = quantile(log_beta, c(0.025, 0.975))
 )
 
+print(ci_results)
+
 
 ```
-The r_squared distribution shows that the linear model consistently explains approximately 90% of the variance in tmax, demonstrating a strong relationship between tmax and tmin. The log_beta distribution, centered around 2.0, reflects the stability of the transformed regression coefficients across bootstrap samples. These results indicate that the model is reliable, with low variability in its ability to capture the relationship between the predictors and the outcome.
+
+The r_squared distribution shows that the linear model consistently explains approximately 90% of the variance in tmax, demonstrating a strong relationship between tmax and tmin. The log_beta distribution, centered around 2.0, reflects the stability of the transformed regression coefficients across bootstrap samples. The histograms of these metrics revealed low variability, and the calculated 95% confidence intervals further confirmed the reliability of these estimates. Overall, the bootstrap analysis underscores the robustness of the linear model in capturing the relationship between minimum and maximum daily temperatures. These results indicate that the model is reliable, with low variability in its ability to capture the relationship between the predictors and the outcome.
 
 
 ---
@@ -66,34 +86,30 @@ The r_squared distribution shows that the linear model consistently explains app
 ### Problem 2: Homicide Analysis
 
 ```{r problem2, echo = TRUE}
-
 homicides_raw = read_csv("https://github.com/washingtonpost/data-homicides/raw/master/homicide-data.csv")
 
-homicides = mutate(
-  filter(
-    mutate(
-      homicides_raw,
-      city_state = str_c(city, state, sep = ", "),
-      resolved = as.numeric(disposition == "Closed by arrest"),
-      victim_race = fct_relevel(victim_race, "White")
-    ),
-    !city_state %in% c("Dallas, TX", "Phoenix, AZ", "Kansas City, MO", "Tulsa, AL"),
-    victim_race %in% c("White", "Black")
-  )
-)
+homicides = homicides_raw
+homicides$city_state = paste(homicides$city, homicides$state, sep = ", ")
+homicides$resolved = as.numeric(homicides$disposition == "Closed by arrest")
+homicides$victim_race = forcats::fct_relevel(homicides$victim_race, "White")
+homicides = subset(homicides, 
+                   !(city_state %in% c("Dallas, TX", "Phoenix, AZ", "Kansas City, MO", "Tulsa, AL")) &
+                   victim_race %in% c("White", "Black") &
+                   !is.na(victim_age))
 
 
-baltimore_data = filter(homicides, city_state == "Baltimore, MD")
+baltimore_data = subset(homicides, city_state == "Baltimore, MD")
 baltimore_glm = glm(resolved ~ victim_age + victim_sex + victim_race, family = binomial(), data = baltimore_data)
 
-baltimore_results = mutate(
-  broom::tidy(baltimore_glm),
-  OR = exp(estimate),
-  .before = estimate
-)
+baltimore_results = broom::tidy(baltimore_glm)
+baltimore_results$OR = exp(baltimore_results$estimate)
+baltimore_results$CI_low = exp(baltimore_results$estimate - 1.96 * baltimore_results$std.error)
+baltimore_results$CI_high = exp(baltimore_results$estimate + 1.96 * baltimore_results$std.error)
 
-homicides_grouped = group_by(homicides, city_state)
-homicides_nested = nest(homicides_grouped)
+print(baltimore_results)
+
+homicides_nested = dplyr::group_by(homicides, city_state)
+homicides_nested = tidyr::nest(homicides_nested)
 
 homicides_nested$models = map(homicides_nested$data, function(data) {
   glm(resolved ~ victim_age + victim_sex + victim_race, family = binomial(), data = data)
@@ -101,28 +117,35 @@ homicides_nested$models = map(homicides_nested$data, function(data) {
 
 homicides_nested$results = map(homicides_nested$models, function(model) {
   tidy_model = broom::tidy(model)
-  filtered_model = filter(tidy_model, term == "victim_sexMale")
-  mutate(filtered_model,
-         OR = exp(estimate),
-         CI_low = exp(estimate - 1.96 * std.error),
-         CI_high = exp(estimate + 1.96 * std.error))
+  filtered_model = subset(tidy_model, term == "victim_sexMale")
+  filtered_model$OR = exp(filtered_model$estimate)
+  filtered_model$CI_low = exp(filtered_model$estimate - 1.96 * filtered_model$std.error)
+  filtered_model$CI_high = exp(filtered_model$estimate + 1.96 * filtered_model$std.error)
+  filtered_model
 })
 
-
-city_glm_results = unnest(select(homicides_nested, city_state, results), cols = results)
+city_glm_results = tidyr::unnest(dplyr::select(homicides_nested, city_state, results), cols = results)
 
 
 city_glm_results$city_state = reorder(city_glm_results$city_state, city_glm_results$OR)
-
-ggplot(data = city_glm_results, aes(x = city_state, y = OR, ymin = CI_low, ymax = CI_high)) +
+ggplot(city_glm_results, aes(x = city_state, y = OR, ymin = CI_low, ymax = CI_high)) +
   geom_pointrange() +
   coord_flip() +
-  labs(title = "Odds Ratios for Male vs Female Victims by City", y = "Adjusted OR", x = "City")
-
+  labs(
+    title = "Odds Ratios for Male vs Female Victims by City",
+    x = "City",
+    y = "Adjusted Odds Ratio"
+  )
 
 
 ```
-The odds ratios for solving homicides comparing male to female victims vary by city, with most cities showing ORs near or below 1. This suggests that homicides involving male victims are generally not more likely to be solved than those involving female victims. Wide confidence intervals for some cities indicate uncertainty in these estimates, likely due to small or sparse datasets, while tighter intervals for others reflect more reliable data. The variability underscores the importance of city-specific factors in determining homicide resolution rates.
+
+This analysis investigated homicide case resolution across 50 large U.S. cities, focusing on differences between male and female victims. Logistic regression models were used to examine how victim characteristics (age, sex, and race) influence the likelihood of resolution ("Closed by arrest"), excluding cities with incomplete data.
+
+In Baltimore, MD, male victims had slightly lower odds of case resolution compared to female victims, with adjusted odds ratios (ORs) below 1. Confidence intervals indicated some variability, likely due to data limitations. Expanding to all cities, city-specific logistic regression models revealed most ORs near or below 1, suggesting little evidence of gender disparity in case resolution rates. However, the variability in ORs across cities highlights significant city-specific factors, with some cities showing wide confidence intervals due to sparse data and others more precise. These results emphasize the need for localized approaches to improve homicide resolution rates.
+
+
+
 
 
 
@@ -137,11 +160,11 @@ birthweight_df = read_csv("./birthweight.csv")
 birthweight_df = mutate(birthweight_df, across(c(babysex, frace, mrace), as_factor))
 fit_birthweight = lm(bwt ~ blength + bhead + delwt + fincome, data = birthweight_df)
 
-# Add predictions and residuals for visualization
+
 birthweight_with_predictions = modelr::add_predictions(birthweight_df, fit_birthweight)
 birthweight_with_residuals = modelr::add_residuals(birthweight_with_predictions, fit_birthweight)
 
-# Plot residuals vs fitted values
+
 ggplot(data = birthweight_with_residuals, aes(x = pred, y = resid)) +
   geom_point() +
   labs(title = "Residuals vs Fitted Values",
@@ -151,13 +174,13 @@ ggplot(data = birthweight_with_residuals, aes(x = pred, y = resid)) +
 
 cv_data = crossv_mc(birthweight_df, 100)
 
-# Fit models and calculate prediction errors
+
 cv_data = mutate(cv_data,
   model1 = map(train, function(.x) lm(bwt ~ blength + gaweeks, data = as.data.frame(.x))),
   model2 = map(train, function(.x) lm(bwt ~ bhead * blength * babysex, data = as.data.frame(.x))),
   model3 = map(train, function(.x) lm(bwt ~ blength + bhead + delwt + fincome, data = as.data.frame(.x))),
   error1 = map2_dbl(model1, test, function(model, test_data) {
-    test_data = as.data.frame(test_data)  # Convert test data to data frame
+    test_data = as.data.frame(test_data)  
     mean((predict(model, newdata = test_data) - test_data$bwt)^2, na.rm = TRUE)
   }),
   error2 = map2_dbl(model2, test, function(model, test_data) {
@@ -169,6 +192,7 @@ cv_data = mutate(cv_data,
     mean((predict(model, newdata = test_data) - test_data$bwt)^2, na.rm = TRUE)
   })
 )
+
 
 
 cv_results = select(cv_data, error1, error2, error3)
@@ -187,6 +211,9 @@ ggplot(cv_results_long, aes(x = Model, y = Error)) +
        y = "Mean Squared Error")
 
 
+
+
+print(knitr::kable(cv_summary, caption = "Cross-Validation Summary for Birthweight Models"))
 
 ```
 
